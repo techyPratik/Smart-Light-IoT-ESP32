@@ -1,1 +1,1930 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
+// =====================================================
+// HARDWARE
+// =====================================================
+
+#define LED_PIN 5
+#define NUM_LEDS 60
+
+#define LDR_PIN 34
+#define PIR_PIN 27
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(
+  OLED_WIDTH,
+  OLED_HEIGHT,
+  &Wire,
+  -1
+);
+
+bool oledOK = false;
+
+Adafruit_NeoPixel strip(
+  NUM_LEDS,
+  LED_PIN,
+  NEO_GRB + NEO_KHZ800
+);
+
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* ssid = "SmartLight";
+const char* password = "12345678";
+
+WebServer server(80);
+
+
+// =====================================================
+// LDR
+// YOUR WORKING CALIBRATION
+// =====================================================
+
+#define DARK_THRESHOLD 1500
+#define BRIGHT_THRESHOLD 2000
+
+#define LDR_SAMPLES 10
+#define LDR_CONFIRM_TIME 2000UL
+
+
+// =====================================================
+// SYSTEM
+// =====================================================
+
+bool darkMode = false;
+
+bool autoMode = true;
+bool manualPower = false;
+bool rainbowMode = false;
+
+bool previousPIR = LOW;
+
+bool waitingDark = false;
+bool waitingBright = false;
+
+unsigned long ldrChangeStart = 0;
+
+
+// =====================================================
+// LED
+// =====================================================
+
+int manualBrightness = 70;
+
+uint32_t manualColor;
+
+uint16_t ambientHue = 0;
+uint16_t rainbowHue = 0;
+
+int motionColor = 0;
+
+
+// =====================================================
+// LDR READING
+// =====================================================
+
+int readLDR()
+{
+  long total = 0;
+
+  for (int i = 0; i < LDR_SAMPLES; i++)
+  {
+    total += analogRead(LDR_PIN);
+    delay(2);
+  }
+
+  return total / LDR_SAMPLES;
+}
+
+
+// =====================================================
+// AUTOMATIC BRIGHTNESS
+// =====================================================
+
+int getBrightness(int ldr)
+{
+  int b = map(
+    ldr,
+    DARK_THRESHOLD,
+    0,
+    30,
+    100
+  );
+
+  return constrain(b, 30, 100);
+}
+
+
+// =====================================================
+// OLED DISPLAY
+// =====================================================
+
+void updateOLED(int ldr, int pir, int brightness)
+{
+  if (!oledOK)
+    return;
+
+  // Continuous OLED light animation
+  static uint8_t lightFrame = 0;
+  lightFrame++;
+
+  bool lightIsOn =
+    (autoMode && darkMode) ||
+    (!autoMode && manualPower);
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ---------------------------------------------------
+  // SMART LIGHT TITLE
+  // ---------------------------------------------------
+
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("SMART");
+
+  display.setCursor(0, 18);
+  display.println("LIGHT");
+
+  // ---------------------------------------------------
+  // ANIMATED LIGHT ICON
+  // A small glowing bulb with moving rays.
+  // It runs continuously whenever the lights are ON.
+  // ---------------------------------------------------
+
+  if (lightIsOn)
+  {
+    int cx = 108;
+    int cy = 18;
+
+    // Bulb glow/pulse
+    int pulse = (lightFrame % 16);
+    if (pulse > 8)
+      pulse = 16 - pulse;
+
+    int radius = 7 + (pulse / 3);
+
+    display.drawCircle(cx, cy, radius, SSD1306_WHITE);
+    display.fillCircle(cx, cy, 3, SSD1306_WHITE);
+
+    // Bulb base
+    display.drawLine(cx - 4, cy + 8, cx + 4, cy + 8, SSD1306_WHITE);
+    display.drawLine(cx - 3, cy + 10, cx + 3, cy + 10, SSD1306_WHITE);
+    display.drawLine(cx - 2, cy + 12, cx + 2, cy + 12, SSD1306_WHITE);
+
+    // Animated rays
+    int ray = lightFrame % 4;
+
+    if (ray == 0 || ray == 2)
+    {
+      display.drawLine(cx, cy - 13, cx, cy - 16, SSD1306_WHITE);
+      display.drawLine(cx, cy + 15, cx, cy + 18, SSD1306_WHITE);
+    }
+
+    if (ray == 1 || ray == 3)
+    {
+      display.drawLine(cx - 13, cy, cx - 16, cy, SSD1306_WHITE);
+      display.drawLine(cx + 13, cy, cx + 16, cy, SSD1306_WHITE);
+    }
+
+    // Corner rays always present for a nice glowing effect
+    display.drawLine(cx - 10, cy - 10, cx - 13, cy - 13, SSD1306_WHITE);
+    display.drawLine(cx + 10, cy - 10, cx + 13, cy - 13, SSD1306_WHITE);
+    display.drawLine(cx - 10, cy + 10, cx - 13, cy + 13, SSD1306_WHITE);
+    display.drawLine(cx + 10, cy + 10, cx + 13, cy + 13, SSD1306_WHITE);
+  }
+  else
+  {
+    // Small OFF indicator when the lights are off
+    display.drawCircle(108, 18, 7, SSD1306_WHITE);
+    display.drawLine(104, 14, 112, 22, SSD1306_WHITE);
+    display.drawLine(112, 14, 104, 22, SSD1306_WHITE);
+  }
+
+  // ---------------------------------------------------
+  // STATUS INFORMATION
+  // ---------------------------------------------------
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 38);
+  display.print("AMBIENT : ");
+  display.println(darkMode ? "DARK" : "BRIGHT");
+
+  display.setCursor(0, 47);
+  display.print("PIR     : ");
+  display.println(pir == HIGH ? "MOTION" : "NO MOTION");
+
+  display.setCursor(0, 56);
+  display.print("MODE    : ");
+  display.print(autoMode ? "AUTO" : "MANUAL");
+  display.print("  ");
+  display.print(brightness);
+  display.print("%");
+
+  display.display();
+}
+
+
+// =====================================================
+// OFF
+// =====================================================
+
+void lightsOff()
+{
+  strip.clear();
+  strip.show();
+}
+
+
+// =====================================================
+// SOLID COLOUR
+// =====================================================
+
+void setAll(uint32_t color)
+{
+  strip.setBrightness(manualBrightness);
+
+  for (int i = 0; i < NUM_LEDS; i++)
+  {
+    strip.setPixelColor(i, color);
+  }
+
+  strip.show();
+}
+
+
+// =====================================================
+// AUTOMATIC AMBIENT LIGHT
+// =====================================================
+
+void ambientLight(int brightness)
+{
+  strip.setBrightness(brightness);
+
+  for (int i = 0; i < NUM_LEDS; i++)
+  {
+    uint16_t hue =
+      ambientHue +
+      ((uint32_t)i * 65536UL / NUM_LEDS);
+
+    strip.setPixelColor(
+      i,
+      strip.gamma32(
+        strip.ColorHSV(hue)
+      )
+    );
+  }
+
+  strip.show();
+
+  ambientHue += 2;
+}
+
+
+// =====================================================
+// PIR EFFECT
+// =====================================================
+
+void motionEffect(int brightness)
+{
+  uint32_t color;
+
+  switch (motionColor % 6)
+  {
+    case 0:
+      color = strip.Color(255, 0, 0);
+      break;
+
+    case 1:
+      color = strip.Color(255, 80, 0);
+      break;
+
+    case 2:
+      color = strip.Color(255, 180, 0);
+      break;
+
+    case 3:
+      color = strip.Color(0, 255, 80);
+      break;
+
+    case 4:
+      color = strip.Color(0, 120, 255);
+      break;
+
+    default:
+      color = strip.Color(180, 0, 255);
+      break;
+  }
+
+  strip.setBrightness(brightness);
+
+  for (int head = -5; head < NUM_LEDS + 5; head++)
+  {
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+      int d = abs(i - head);
+
+      if (d == 0)
+      {
+        strip.setPixelColor(
+          i,
+          strip.Color(255, 255, 255)
+        );
+      }
+      else if (d <= 2)
+      {
+        strip.setPixelColor(i, color);
+      }
+      else
+      {
+        strip.setPixelColor(
+          i,
+          strip.Color(
+            ((uint8_t)(color >> 16)) / 5,
+            ((uint8_t)(color >> 8)) / 5,
+            ((uint8_t)color) / 5
+          )
+        );
+      }
+    }
+
+    strip.show();
+    delay(12);
+  }
+
+  motionColor++;
+}
+
+
+// =====================================================
+// RAINBOW EFFECT
+// =====================================================
+
+void rainbowEffect()
+{
+  strip.setBrightness(manualBrightness);
+
+  for (int i = 0; i < NUM_LEDS; i++)
+  {
+    uint16_t hue =
+      rainbowHue +
+      ((uint32_t)i * 65536UL / NUM_LEDS);
+
+    strip.setPixelColor(
+      i,
+      strip.gamma32(
+        strip.ColorHSV(hue)
+      )
+    );
+  }
+
+  strip.show();
+
+  rainbowHue += 180;
+}
+
+
+// =====================================================
+// FLOW EFFECT
+// =====================================================
+
+void flowEffect()
+{
+  uint32_t color =
+    strip.Color(255, 80, 10);
+
+  strip.setBrightness(manualBrightness);
+
+  for (int head = -4; head < NUM_LEDS + 4; head++)
+  {
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+      int d = abs(i - head);
+
+      if (d == 0)
+      {
+        strip.setPixelColor(
+          i,
+          strip.Color(255, 255, 255)
+        );
+      }
+      else if (d <= 2)
+      {
+        strip.setPixelColor(i, color);
+      }
+      else
+      {
+        strip.setPixelColor(
+          i,
+          strip.Color(8, 3, 1)
+        );
+      }
+    }
+
+    strip.show();
+    delay(10);
+
+    // Keep web server alive
+    server.handleClient();
+  }
+}
+
+
+// =====================================================
+// LDR HYSTERESIS
+// =====================================================
+
+void updateLightState(int ldr)
+{
+  // IMPORTANT:
+  // LDR controls lighting only in AUTO mode.
+
+  if (!autoMode)
+  {
+    return;
+  }
+
+
+  // ---------------- DARK ----------------
+
+  if (ldr < DARK_THRESHOLD)
+  {
+    waitingBright = false;
+
+    if (!darkMode)
+    {
+      if (!waitingDark)
+      {
+        waitingDark = true;
+        ldrChangeStart = millis();
+      }
+      else if (
+        millis() - ldrChangeStart >=
+        LDR_CONFIRM_TIME
+      )
+      {
+        darkMode = true;
+        waitingDark = false;
+
+        Serial.println("DARK CONFIRMED");
+      }
+    }
+
+    return;
+  }
+
+
+  // ---------------- BRIGHT ----------------
+
+  if (ldr > BRIGHT_THRESHOLD)
+  {
+    waitingDark = false;
+
+    if (darkMode)
+    {
+      if (!waitingBright)
+      {
+        waitingBright = true;
+        ldrChangeStart = millis();
+      }
+      else if (
+        millis() - ldrChangeStart >=
+        LDR_CONFIRM_TIME
+      )
+      {
+        darkMode = false;
+        waitingBright = false;
+
+        lightsOff();
+
+        Serial.println("BRIGHT CONFIRMED");
+      }
+    }
+
+    return;
+  }
+
+
+  // ---------------- MIDDLE ----------------
+
+  waitingDark = false;
+  waitingBright = false;
+}
+
+
+// =====================================================
+// WEB PAGE
+// =====================================================
+
+String webpage()
+{
+  return R"HTML(
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width,
+initial-scale=1">
+
+<title>Smart Light</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #080b11;
+  color: #f5f5f5;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.header {
+  text-align: center;
+  padding: 25px 15px 18px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 29px;
+}
+
+.header p {
+  color: #8d96a5;
+  margin-top: 7px;
+}
+
+.container {
+  max-width: 520px;
+  margin: auto;
+  padding: 0 14px 30px;
+}
+
+.card {
+  background: #151a23;
+  border: 1px solid #272f3c;
+  border-radius: 20px;
+  padding: 18px;
+  margin-bottom: 14px;
+}
+
+.title {
+  font-size: 16px;
+  font-weight: bold;
+  margin-bottom: 15px;
+}
+
+.status {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.box {
+  background: #0d121a;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.label {
+  color: #7f8998;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.value {
+  margin-top: 6px;
+  font-size: 17px;
+  font-weight: bold;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+}
+
+button {
+  width: 100%;
+  border: 1px solid #343e4e;
+  background: #232b39;
+  color: white;
+  padding: 14px 8px;
+  border-radius: 13px;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+button:active {
+  transform: scale(0.97);
+  background: #3a4658;
+}
+
+.on {
+  background: #183c29;
+}
+
+.off {
+  background: #3c2024;
+}
+
+.colors {
+  display: flex;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.color {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  padding: 0;
+}
+
+.red {
+  background: #ef4444;
+}
+
+.green {
+  background: #22c55e;
+}
+
+.blue {
+  background: #3b82f6;
+}
+
+.yellow {
+  background: #facc15;
+}
+
+.purple {
+  background: #a855f7;
+}
+
+.white {
+  background: #eeeeee;
+}
+
+.big {
+  text-align: center;
+  font-size: 30px;
+  font-weight: bold;
+  margin: 5px 0 12px;
+}
+
+input[type=range] {
+  width: 100%;
+}
+
+.footer {
+  text-align: center;
+  color: #667184;
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="header">
+
+<h1>SMART LIGHT</h1>
+
+<p>ESP32 IoT Lighting System</p>
+
+</div>
+
+
+<div class="container">
+
+
+<!-- STATUS -->
+
+<div class="card">
+
+<div class="title">
+SYSTEM STATUS
+</div>
+
+<div class="status">
+
+<div class="box">
+<div class="label">Ambient</div>
+<div class="value" id="ambient">---</div>
+</div>
+
+<div class="box">
+<div class="label">PIR</div>
+<div class="value" id="pir">---</div>
+</div>
+
+<div class="box">
+<div class="label">LDR</div>
+<div class="value" id="ldr">---</div>
+</div>
+
+<div class="box">
+<div class="label">Brightness</div>
+<div class="value" id="bright">---</div>
+</div>
+
+<div class="box">
+<div class="label">Mode</div>
+<div class="value" id="mode">---</div>
+</div>
+
+<div class="box">
+<div class="label">Status</div>
+<div class="value">ONLINE</div>
+</div>
+
+</div>
+
+</div>
+
+
+<!-- MODE -->
+
+<div class="card">
+
+<div class="title">
+CONTROL MODE
+</div>
+
+<div class="row">
+
+<form action="/auto"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button type="submit">
+AUTO
+</button>
+
+</form>
+
+
+<form action="/manual"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button type="submit">
+MANUAL
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+
+<!-- POWER -->
+
+<div class="card">
+
+<div class="title">
+POWER
+</div>
+
+<div class="row">
+
+<form action="/on"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button class="on"
+type="submit">
+ON
+</button>
+
+</form>
+
+
+<form action="/off"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button class="off"
+type="submit">
+OFF
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+
+<!-- COLOUR -->
+
+<div class="card">
+
+<div class="title">
+COLOUR
+</div>
+
+<div class="colors">
+
+
+<form action="/red"
+method="get"
+target="commandFrame">
+
+<button class="color red"
+type="submit">
+</button>
+
+</form>
+
+
+<form action="/green"
+method="get"
+target="commandFrame">
+
+<button class="color green"
+type="submit">
+</button>
+
+</form>
+
+
+<form action="/blue"
+method="get"
+target="commandFrame">
+
+<button class="color blue"
+type="submit">
+</button>
+
+</form>
+
+
+<form action="/yellow"
+method="get"
+target="commandFrame">
+
+<button class="color yellow"
+type="submit">
+</button>
+
+</form>
+
+
+<form action="/purple"
+method="get"
+target="commandFrame">
+
+<button class="color purple"
+type="submit">
+</button>
+
+</form>
+
+
+<form action="/white"
+method="get"
+target="commandFrame">
+
+<button class="color white"
+type="submit">
+</button>
+
+</form>
+
+
+</div>
+
+</div>
+
+
+<!-- EFFECTS -->
+
+<div class="card">
+
+<div class="title">
+LIGHT EFFECTS
+</div>
+
+<div class="row">
+
+
+<form action="/rainbow"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button type="submit">
+RAINBOW
+</button>
+
+</form>
+
+
+<form action="/flow"
+method="get"
+target="commandFrame"
+style="width:100%;">
+
+<button type="submit">
+FLOW
+</button>
+
+</form>
+
+
+</div>
+
+</div>
+
+
+<!-- BRIGHTNESS -->
+
+<div class="card">
+
+<div class="title">
+BRIGHTNESS
+</div>
+
+<div class="big"
+id="brightnessValue">
+70%
+</div>
+
+<form action="/brightness"
+method="get"
+target="commandFrame">
+
+<input
+type="range"
+name="value"
+min="1"
+max="100"
+value="70"
+oninput="showBrightness(this.value)"
+onchange="this.form.submit()">
+
+</form>
+
+</div>
+
+
+<div class="footer">
+SMART LIGHT | ESP32
+</div>
+
+
+</div>
+
+
+<!-- Hidden command receiver -->
+
+<iframe
+name="commandFrame"
+style="display:none;">
+</iframe>
+
+
+<script>
+
+function showBrightness(value)
+{
+  document.getElementById(
+    "brightnessValue"
+  ).innerHTML = value + "%";
+}
+
+
+function updateStatus()
+{
+  fetch("/status")
+
+  .then(function(response)
+  {
+    return response.json();
+  })
+
+  .then(function(data)
+  {
+
+    document.getElementById(
+      "ambient"
+    ).innerHTML = data.ambient;
+
+
+    document.getElementById(
+      "pir"
+    ).innerHTML = data.pir;
+
+
+    document.getElementById(
+      "ldr"
+    ).innerHTML = data.ldr;
+
+
+    document.getElementById(
+      "bright"
+    ).innerHTML =
+      data.brightness + "%";
+
+
+    document.getElementById(
+      "mode"
+    ).innerHTML = data.mode;
+
+  })
+
+  .catch(function()
+  {
+    document.getElementById(
+      "mode"
+    ).innerHTML = "OFFLINE";
+  });
+}
+
+
+updateStatus();
+
+setInterval(
+  updateStatus,
+  1500
+);
+
+</script>
+
+
+</body>
+
+</html>
+
+)HTML";
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // ===================================================
+  // OLED INITIALIZATION
+  // ===================================================
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
+  {
+    oledOK = true;
+
+    // -------------------------------------------------
+    // SCREEN 1: WELCOME ANIMATION
+    // -------------------------------------------------
+
+    display.setTextColor(SSD1306_WHITE);
+
+    // Welcome title
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(22, 5);
+    display.println("WELCOME!");
+
+    display.setTextSize(1);
+    display.setCursor(31, 28);
+    display.println("SMART LIGHT");
+
+    // Smile appears
+    display.drawCircle(64, 49, 12, SSD1306_WHITE);
+    display.fillCircle(60, 46, 2, SSD1306_WHITE);
+    display.fillCircle(68, 46, 2, SSD1306_WHITE);
+    display.drawLine(59, 53, 61, 55, SSD1306_WHITE);
+    display.drawLine(61, 55, 64, 56, SSD1306_WHITE);
+    display.drawLine(64, 56, 67, 55, SSD1306_WHITE);
+    display.drawLine(67, 55, 69, 53, SSD1306_WHITE);
+    display.display();
+    delay(2200);
+
+    // -------------------------------------------------
+    // SCREEN 2: INITIALISING + WAITING ANIMATION
+    // -------------------------------------------------
+
+    for (int frame = 0; frame < 8; frame++)
+    {
+      display.clearDisplay();
+      display.setTextSize(1);
+
+      display.setCursor(25, 5);
+      display.println("SMART LIGHT");
+
+      display.setCursor(27, 19);
+      display.println("INITIALISING");
+
+      display.setCursor(30, 33);
+      display.print("PLEASE WAIT");
+
+      // Animated dots
+      display.setCursor(96, 33);
+      for (int d = 0; d < (frame % 4); d++)
+      {
+        display.print(".");
+      }
+
+      // Animated progress bar
+      display.drawRect(18, 48, 92, 9, SSD1306_WHITE);
+      int progress = ((frame + 1) * 88) / 8;
+      display.fillRect(20, 50, progress, 5, SSD1306_WHITE);
+
+      display.setCursor(50, 59);
+      display.print("LOADING");
+
+      display.display();
+      delay(250);
+    }
+
+    Serial.println("OLED READY");
+  }
+  else
+  {
+    oledOK = false;
+    Serial.println("OLED NOT FOUND");
+  }
+
+  pinMode(PIR_PIN, INPUT);
+
+  strip.begin();
+  strip.clear();
+  strip.show();
+
+  manualColor =
+    strip.Color(255, 150, 50);
+
+
+  // ===================================================
+  // WIFI ACCESS POINT
+  // ===================================================
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    ssid,
+    password
+  );
+
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println(" SMART LIGHT");
+  Serial.println("==============================");
+
+  Serial.print("WiFi: ");
+  Serial.println(ssid);
+
+  Serial.print("IP: ");
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+
+  // ===================================================
+  // HOME
+  // ===================================================
+
+  server.on(
+    "/",
+    HTTP_GET,
+    []()
+    {
+      server.send(
+        200,
+        "text/html",
+        webpage()
+      );
+    }
+  );
+
+
+  // ===================================================
+  // STATUS
+  // ===================================================
+
+  server.on(
+    "/status",
+    HTTP_GET,
+    []()
+    {
+      int ldr = readLDR();
+
+      int pir =
+        digitalRead(PIR_PIN);
+
+      int brightness;
+
+
+      if (autoMode)
+      {
+        brightness =
+          darkMode
+          ? getBrightness(ldr)
+          : 0;
+      }
+      else
+      {
+        brightness =
+          manualPower
+          ? manualBrightness
+          : 0;
+      }
+
+
+      String json = "{";
+
+
+      json += "\"ldr\":";
+      json += String(ldr);
+
+
+      json += ",\"ambient\":\"";
+
+      json +=
+        darkMode
+        ? "DARK"
+        : "BRIGHT";
+
+      json += "\"";
+
+
+      json += ",\"pir\":\"";
+
+      json +=
+        pir
+        ? "MOTION"
+        : "NO MOTION";
+
+      json += "\"";
+
+
+      json += ",\"brightness\":";
+      json += String(brightness);
+
+
+      json += ",\"mode\":\"";
+
+      json +=
+        autoMode
+        ? "AUTO"
+        : "MANUAL";
+
+      json += "\"";
+
+
+      json += "}";
+
+
+      server.send(
+        200,
+        "application/json",
+        json
+      );
+    }
+  );
+
+
+  // ===================================================
+  // AUTO
+  // ===================================================
+
+  server.on(
+    "/auto",
+    HTTP_GET,
+    []()
+    {
+      autoMode = true;
+
+      manualPower = false;
+
+      rainbowMode = false;
+
+      Serial.println("AUTO MODE");
+
+      server.send(
+        200,
+        "text/plain",
+        "AUTO"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // MANUAL
+  // ===================================================
+
+  server.on(
+    "/manual",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      Serial.println("MANUAL MODE");
+
+      server.send(
+        200,
+        "text/plain",
+        "MANUAL"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // ON
+  // ===================================================
+
+  server.on(
+    "/on",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      setAll(manualColor);
+
+      Serial.println("MANUAL ON");
+
+      server.send(
+        200,
+        "text/plain",
+        "ON"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // OFF
+  // ===================================================
+
+  server.on(
+    "/off",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = false;
+
+      rainbowMode = false;
+
+      lightsOff();
+
+      Serial.println("MANUAL OFF");
+
+      server.send(
+        200,
+        "text/plain",
+        "OFF"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // RED
+  // ===================================================
+
+  server.on(
+    "/red",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(255, 0, 0);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "RED"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // GREEN
+  // ===================================================
+
+  server.on(
+    "/green",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(0, 255, 0);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "GREEN"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // BLUE
+  // ===================================================
+
+  server.on(
+    "/blue",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(0, 0, 255);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "BLUE"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // YELLOW
+  // ===================================================
+
+  server.on(
+    "/yellow",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(255, 180, 0);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "YELLOW"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // PURPLE
+  // ===================================================
+
+  server.on(
+    "/purple",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(180, 0, 255);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "PURPLE"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // WHITE
+  // ===================================================
+
+  server.on(
+    "/white",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      manualColor =
+        strip.Color(255, 255, 255);
+
+      setAll(manualColor);
+
+      server.send(
+        200,
+        "text/plain",
+        "WHITE"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // RAINBOW
+  // ===================================================
+
+  server.on(
+    "/rainbow",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = true;
+
+      Serial.println("RAINBOW");
+
+      server.send(
+        200,
+        "text/plain",
+        "RAINBOW"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // FLOW
+  // ===================================================
+
+  server.on(
+    "/flow",
+    HTTP_GET,
+    []()
+    {
+      autoMode = false;
+
+      manualPower = true;
+
+      rainbowMode = false;
+
+      Serial.println("FLOW");
+
+      flowEffect();
+
+      server.send(
+        200,
+        "text/plain",
+        "FLOW"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // BRIGHTNESS
+  // ===================================================
+
+  server.on(
+    "/brightness",
+    HTTP_GET,
+    []()
+    {
+      if (server.hasArg("value"))
+      {
+        manualBrightness =
+          server.arg("value").toInt();
+
+        manualBrightness =
+          constrain(
+            manualBrightness,
+            1,
+            100
+          );
+
+
+        if (
+          manualPower &&
+          !rainbowMode
+        )
+        {
+          setAll(manualColor);
+        }
+      }
+
+      server.send(
+        200,
+        "text/plain",
+        "BRIGHTNESS"
+      );
+    }
+  );
+
+
+  // ===================================================
+  // START SERVER
+  // ===================================================
+
+  server.begin();
+
+  Serial.println(
+    "Web server started"
+  );
+
+
+  // ===================================================
+  // PIR WARMUP
+  // ===================================================
+
+  Serial.println(
+    "PIR warming up..."
+  );
+
+  // -------------------------------------------------
+  // OLED: PIR WARM-UP WAITING ANIMATION
+  // Keeps the original 30-second warm-up time.
+  // -------------------------------------------------
+
+  if (oledOK)
+  {
+    unsigned long warmupStart = millis();
+    int frame = 0;
+
+    while (millis() - warmupStart < 30000UL)
+    {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+
+      display.setCursor(25, 5);
+      display.println("SMART LIGHT");
+
+      display.setCursor(27, 19);
+      display.println("INITIALISING");
+
+      display.setCursor(25, 33);
+      display.println("PIR WARMING UP");
+
+      // Spinner animation
+      display.setCursor(57, 44);
+      const char spinner[] = {'|', '/', '-', '\\'};
+      display.print(spinner[frame % 4]);
+
+      // 30-second progress bar
+      display.drawRect(12, 54, 104, 8, SSD1306_WHITE);
+      unsigned long elapsed = millis() - warmupStart;
+      int progress = (int)((elapsed * 100UL) / 30000UL);
+      if (progress > 100) progress = 100;
+      display.fillRect(14, 56, (progress * 100) / 100, 4, SSD1306_WHITE);
+
+      display.display();
+
+      frame++;
+      delay(250);
+    }
+  }
+  else
+  {
+    // Keep the original PIR warm-up when OLED is unavailable.
+    delay(30000);
+  }
+
+  Serial.println(
+    "SYSTEM READY"
+  );
+
+  // -------------------------------------------------
+  // OLED: SYSTEM READY
+  // -------------------------------------------------
+
+  if (oledOK)
+  {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(28, 10);
+    display.println("SYSTEM READY");
+
+    display.setCursor(25, 28);
+    display.println("SMART LIGHT");
+
+    display.setCursor(31, 45);
+    display.println("IoT ONLINE");
+
+    display.display();
+    delay(1200);
+  }
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  server.handleClient();
+
+
+  int ldr =
+    readLDR();
+
+
+  updateLightState(ldr);
+
+
+  // ===================================================
+  // AUTO MODE
+  // ===================================================
+
+  if (autoMode)
+  {
+
+    // DAY
+
+    if (!darkMode)
+    {
+      lightsOff();
+
+      int pir = digitalRead(PIR_PIN);
+
+      updateOLED(
+        ldr,
+        pir,
+        0
+      );
+
+      delay(30);
+
+      return;
+    }
+
+
+    // DARK
+
+    int brightness =
+      getBrightness(ldr);
+
+    int pir =
+      digitalRead(PIR_PIN);
+
+    updateOLED(
+      ldr,
+      pir,
+      brightness
+    );
+
+
+    // NEW PIR MOTION
+
+    if (
+      pir == HIGH &&
+      previousPIR == LOW
+    )
+    {
+      Serial.println(
+        "PIR MOTION"
+      );
+
+      motionEffect(
+        brightness
+      );
+    }
+
+
+    previousPIR = pir;
+
+
+    // NORMAL AMBIENT
+
+    ambientLight(
+      brightness
+    );
+  }
+
+
+  // ===================================================
+  // MANUAL RAINBOW
+  // ===================================================
+
+  else if (
+    manualPower &&
+    rainbowMode
+  )
+  {
+    rainbowEffect();
+
+    int pir = digitalRead(PIR_PIN);
+
+    updateOLED(
+      ldr,
+      pir,
+      manualBrightness
+    );
+  }
+
+
+  // ===================================================
+  // MANUAL SOLID
+  // ===================================================
+
+  else if (
+    manualPower &&
+    !rainbowMode
+  )
+  {
+    int pir = digitalRead(PIR_PIN);
+
+    updateOLED(
+      ldr,
+      pir,
+      manualBrightness
+    );
+
+    // Already displayed by command.
+    // Keep server responsive.
+
+    delay(20);
+  }
+
+
+  delay(10);
+}
