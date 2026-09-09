@@ -45,8 +45,8 @@ Adafruit_NeoPixel strip(
 // WIFI
 // =====================================================
 
-const char* ssid = "SmartLight";
-const char* password = "12345678";
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
 
 WebServer server(80);
 
